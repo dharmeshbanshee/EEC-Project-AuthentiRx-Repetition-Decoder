@@ -1,0 +1,95 @@
+// =============================================================================
+// design.sv -- AuthentiRx : rep_decoder
+// Repetition-code fuzzy extractor (key reconstruction), streaming
+// -----------------------------------------------------------------------------
+// THE IDEA (code-offset construction)
+// Enrollment (factory, off-chip): pick a random key K. Measure raw PUF bits R.
+// Build the codeword C = each key bit repeated REP times.
+// Helper data W = R xor C. (W is public: safe to store on the server.)
+// Run time (this block): the chip measures raw bits R' (R plus some noise).
+// R' xor W = C plus the same noise.
+// For each group of REP bits, majority vote -> one key bit. Noise in up to
+// (REP-1)/2 bits of a group is corrected.
+//
+// STREAMING: bits arrive one per 'in_valid' (one per measured oscillator pair),
+// so we need only a small vote counter and a KEY_BITS shift register, not a
+// NUM_PAIRS-bit buffer.
+//
+// Bit order: group 0 -> key[KEY_BITS-1] (MSB first), last group -> key[0].
+// 'key_valid' pulses 1 cycle when all KEY_BITS bits are done; 'key' then holds
+// until the next key starts shifting in.
+// 'clear' aborts a partially-received key (protocol reset).
+// 'wipe' additionally zeroes the key register itself: the key must only exist
+// while it is in use, so the controller wipes it right after the HMAC, and on
+// tamper. (This register IS the chip's 'key register' in the architecture.)
+//
+// NOTE vs. the chip source: the only change for EDA Playground is that the
+// parameter defaults are literals here instead of authx_pkg::REP / ::KEY_BITS,
+// because the package is not loaded in the playground. The logic is identical.
+// =============================================================================
+`timescale 1ns/1ps
+
+module rep_decoder #(
+  parameter int REP   = 5, // raw PUF bits per key bit - MUST BE ODD
+  parameter int KEY_BITS = 64 // recovered key length
+)(
+  input logic        clk,
+  input logic        rst_n,
+  input logic        clear,     // abort / restart
+  input logic        wipe,       // zero the key NOW (after use, or tamper)
+  input logic        in_valid, // one pulse per measured pair
+  input logic        raw_bit,     // from puf_meas
+  input logic        helper_bit, // matching public helper-data bit
+  output logic [KEY_BITS-1:0] key,
+  output logic        key_valid
+);
+
+ localparam int VOTE_W = $clog2(REP + 1);
+ localparam int GRP_W = (REP > 1)   ? $clog2(REP) : 1;
+ localparam int KCNT_W = (KEY_BITS > 1) ? $clog2(KEY_BITS) : 1;
+
+ logic [VOTE_W-1:0] ones;   // votes for '1' in the current group
+ logic [GRP_W-1:0] grp_cnt; // how many bits of the current group are in
+ logic [KCNT_W-1:0] key_cnt; // how many key bits are done
+
+ wire         x      = raw_bit ^ helper_bit;    // un-mask: codeword + noise
+ wire [VOTE_W-1:0] ones_next = ones + {{(VOTE_W-1){1'b0}}, x};
+ wire       maj    = (ones_next > (REP/2)); // REP odd -> no ties
+
+ always_ff @(posedge clk or negedge rst_n) begin
+  if (!rst_n) begin
+    ones      <= '0;
+    grp_cnt <= '0;
+    key_cnt <= '0;
+    key       <= '0;
+    key_valid <= 1'b0;
+  end else begin
+    key_valid <= 1'b0;
+    if (wipe) begin
+      ones <= '0;
+      grp_cnt <= '0;
+      key_cnt <= '0;
+      key <= '0;
+    end else if (clear) begin
+      ones <= '0;
+      grp_cnt <= '0;
+      key_cnt <= '0;
+    end else if (in_valid) begin
+      if (grp_cnt == REP-1) begin        // last bit of this group
+        key <= {key[KEY_BITS-2:0], maj}; // shift decoded bit in
+        ones <= '0;
+        grp_cnt <= '0;
+        if (key_cnt == KEY_BITS-1) begin       // last key bit
+          key_cnt <= '0;
+          key_valid <= 1'b1;
+        end else
+          key_cnt <= key_cnt + 1'b1;
+      end else begin
+        ones <= ones_next;
+        grp_cnt <= grp_cnt + 1'b1;
+      end
+    end
+  end
+ end
+
+endmodule
